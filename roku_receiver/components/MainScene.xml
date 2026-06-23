@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="MainScene" extends="Scene" initialFocus="video">
+  <interface>
+    <field id="launchArgs" type="assocarray" onChange="onLaunchArgs" />
+    <field id="ecpInput"   type="assocarray" onChange="onEcpInput" />
+  </interface>
+  <children>
+    <Video id="video" width="1920" height="1080" translation="[0,0]" />
+    <Label id="status" text="PC Caster — waiting for a stream…"
+           translation="[70,60]" color="0xFFFFFFFF"
+           font="font:MediumSystemFont" />
+  </children>
+  <script type="text/brightscript" uri="MainScene.brs" />
+</component>

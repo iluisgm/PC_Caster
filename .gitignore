@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PC Caster runtime files
+pc_caster.log
+pc_caster.log.*
+
+# Local user settings live in the home folder (~/.pc_caster.json),
+# but ignore any stray copy here just in case.
+.pc_caster.json
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
