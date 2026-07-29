@@ -17,7 +17,8 @@ import os
 import webbrowser
 from urllib.parse import quote
 
-from stream_finder import find_streams, find_streams_interactive
+from stream_finder import (find_streams, find_streams_interactive,
+                           stream_reliability, rank_streams)
 from hls_proxy import HlsProxy, ensure_firewall_rule
 import roku_deploy
 from logger import setup_logging, LOG_FILE
@@ -636,6 +637,8 @@ class PCCaster:
         self._scan_seen = set()          # urls already shown in the modal
         self._scan_lock = threading.Lock()
         self._scan_token = None          # 'PLAYWRIGHT_MISSING' / 'NO_BROWSER'
+        self._scan_scores = {}           # iid -> reliability score
+        self._scan_best_iid = None       # iid currently auto-selected (best)
 
         self.find_btn.configure(state="disabled", text="🔍  Scanning…")
         self._open_scanner_modal()
@@ -691,14 +694,19 @@ class PCCaster:
 
         list_wrap = tk.Frame(f, bg=BORDER, bd=1, relief="solid")
         list_wrap.pack(fill="both", expand=True)
-        cols = ("label", "host", "ref")
+        cols = ("label", "host", "rel", "ref")
         tv = ttk.Treeview(list_wrap, columns=cols, show="headings", height=7)
         tv.heading("label", text="Stream")
         tv.heading("host",  text="Host")
+        tv.heading("rel",   text="Reliability")
         tv.heading("ref",   text="Needs Referer?")
-        tv.column("label", width=210, stretch=True)
-        tv.column("host",  width=260, stretch=True)
+        tv.column("label", width=200, stretch=True)
+        tv.column("host",  width=210, stretch=True)
+        tv.column("rel",   width=100, anchor="center", stretch=False)
         tv.column("ref",   width=110, anchor="center", stretch=False)
+        # Token-locked streams are tinted so the unreliable ones stand out.
+        tv.tag_configure("open", foreground=GREEN)
+        tv.tag_configure("token", foreground=RED)
         tv.pack(fill="both", expand=True, padx=1, pady=1)
         self._scan_tv = tv
 
@@ -727,10 +735,29 @@ class PCCaster:
             self._scan_seen.add(r["url"])
             host = urlparse(r["url"]).netloc
             needs = "yes" if r.get("referer") else "—"
-            self._scan_tv.insert("", "end", iid=str(i),
-                                 values=(r["label"], host, needs))
-            if len(self._scan_tv.get_children()) == 1:
-                self._scan_tv.selection_set("0")
+            score, rel = stream_reliability(r)
+            self._scan_scores[str(i)] = score
+            # Insert above the first existing row with a lower score so the most
+            # reliable stream floats to the top. iid stays = index into
+            # _scan_results, so selection still maps back correctly.
+            pos = "end"
+            for n, child in enumerate(self._scan_tv.get_children()):
+                if score > self._scan_scores.get(child, 0):
+                    pos = n
+                    break
+            self._scan_tv.insert("", pos, iid=str(i), tags=(rel,),
+                                 values=(r["label"], host, rel, needs))
+
+        # Auto-select the best (most reliable) row — but stop overriding once the
+        # user has manually picked something else.
+        children = self._scan_tv.get_children()
+        if children:
+            best = max(children, key=lambda c: self._scan_scores.get(c, 0))
+            cur = self._scan_tv.selection()
+            if not cur or (self._scan_best_iid is not None
+                           and cur and cur[0] == self._scan_best_iid):
+                self._scan_tv.selection_set(best)
+            self._scan_best_iid = best
         self._scan_count.set(f"Found: {len(items)}")
         self.root.after(400, self._poll_scan_modal)
 
@@ -775,8 +802,9 @@ class PCCaster:
 
         with self._scan_lock:
             n = len(self._scan_results)
-            urls = [r["url"][:90] for r in self._scan_results]
-        log.info("Scan finished: %d stream(s) captured: %s", n, urls)
+            ranked = rank_streams(self._scan_results)
+        urls = [f"[{stream_reliability(r)[1]}] {r['url'][:80]}" for r in ranked]
+        log.info("Scan finished: %d stream(s) captured (best first): %s", n, urls)
         if n == 0:
             self._set_status("No .m3u8 captured. Did you click a server link?", RED)
         else:

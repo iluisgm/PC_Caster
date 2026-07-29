@@ -42,6 +42,53 @@ def _label_for(url: str) -> str:
     return name[:48]
 
 
+# ── Stream reliability ranking ────────────────────────────────────────────────
+# Some hosts hand out short-lived, single-session tokens (the URL contains a
+# "/secure/" gate and an opaque token). Streams from these die seconds after
+# capture — they play for ~1s then 403, so we rank them BELOW open CDNs. Open
+# CDNs (Rumble, CloudFront, Akamai…) serve plain segments that keep working, so
+# we prefer them automatically when a scan returns several candidates.
+
+from urllib.parse import urlparse as _urlparse
+
+_TOKEN_HOSTS = ("strmd.st", "indianservers.st")
+_OPEN_HOSTS = ("rumble.cloud", "cloudfront.net", "akamaized.net",
+               "akamaihd.net", "akamai.net")
+
+
+def stream_reliability(item: dict) -> tuple[int, str]:
+    """Score a captured stream by how likely it is to KEEP playing.
+
+    Higher score = more reliable. Returns (score, short_label) where the label
+    is one of 'open' / 'token' / 'expiring' for display in the picker.
+    """
+    p = _urlparse(item.get("url", ""))
+    host = p.netloc.lower()
+    path = p.path.lower()
+
+    score = 0
+    token = False
+    if "/secure/" in path:
+        score -= 5
+        token = True
+    if any(host == h or host.endswith("." + h) for h in _TOKEN_HOSTS):
+        score -= 3
+        token = True
+    if any(o in host for o in _OPEN_HOSTS):
+        score += 3
+
+    label = "token" if token else "open"
+    return score, label
+
+
+def rank_streams(items: list[dict]) -> list[dict]:
+    """Return items sorted best-first (open CDNs above token-locked ones).
+
+    Stable: streams with equal reliability keep their original capture order.
+    """
+    return sorted(items, key=lambda it: -stream_reliability(it)[0])
+
+
 # ── Strategy 1: quick scrape ──────────────────────────────────────────────────
 
 def _scrape_html(page_url: str, on_log) -> list[dict]:

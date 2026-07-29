@@ -21,7 +21,9 @@ Public API
 
 import base64
 import logging
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,6 +94,63 @@ def lan_ip_towards(target_ip: str) -> str:
         s.close()
 
 
+# Roku hardware decoders reject HE-AAC (SBR) audio in TS segments with
+# "decoder:pump:Unsupported AAC stream", even though VLC plays it fine.
+# When ffmpeg is available we probe the first segment per host and, if the
+# audio is HE-AAC, re-encode just the audio to AAC-LC (video is copied).
+_FFMPEG  = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_audio_fix: dict[str, bool] = {}   # netloc -> segment audio needs transcode
+
+
+def _probe_needs_audio_fix(data: bytes) -> bool:
+    if not (_FFMPEG and _FFPROBE):
+        return False
+    try:
+        p = subprocess.run(
+            [_FFPROBE, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=profile", "-of", "csv=p=0",
+             "-i", "pipe:0"],
+            input=data, capture_output=True, timeout=15)
+        prof = (p.stdout or b"").decode(errors="ignore").strip().lower()
+        return "he-aac" in prof or "sbr" in prof
+    except Exception:
+        return False
+
+
+def _transcode_audio_to_lc(data: bytes) -> bytes:
+    """Re-encode segment audio to AAC-LC, copy video, keep timestamps."""
+    try:
+        p = subprocess.run(
+            [_FFMPEG, "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?",
+             "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "128k",
+             "-copyts", "-muxpreload", "0", "-muxdelay", "0",
+             "-f", "mpegts", "pipe:1"],
+            input=data, capture_output=True, timeout=20)
+        if p.returncode == 0 and p.stdout:
+            return p.stdout
+    except Exception:
+        pass
+    return data
+
+
+# Some hosts (strmd.st) put date-encoded values like 20260706098359 in
+# #EXT-X-MEDIA-SEQUENCE. That overflows Roku's 32-bit playlist parser
+# ("reader pick stream error: parsing failed"), so we shift it down to a
+# small number. The offset is remembered per playlist URL so the sequence
+# still advances consistently across live reloads.
+_seq_bases: dict[tuple[str, str], int] = {}
+_SEQ_MAX = 2**31 - 1
+
+
+def _safe_seq(tag: str, value: int, playlist_url: str) -> int:
+    if value <= _SEQ_MAX:
+        return value
+    base = _seq_bases.setdefault((tag, playlist_url), value - 1000)
+    return max(0, value - base)
+
+
 def _rewrite_playlist(text: str, base_url: str, referer: str,
                       proxy_origin: str) -> str:
     """Rewrite every URI in an m3u8 so it routes back through this proxy."""
@@ -108,6 +167,15 @@ def _rewrite_playlist(text: str, base_url: str, referer: str,
             out.append(line)
             continue
         if s.startswith("#"):
+            for tag in ("#EXT-X-MEDIA-SEQUENCE:",
+                        "#EXT-X-DISCONTINUITY-SEQUENCE:"):
+                if s.startswith(tag):
+                    try:
+                        n = int(s[len(tag):].strip())
+                        s = line = f"{tag}{_safe_seq(tag, n, base_url)}"
+                    except ValueError:
+                        pass
+                    break
             # Tags that embed a URI="..." attribute (keys, media, maps).
             if 'URI="' in s:
                 pre, rest = s.split('URI="', 1)
@@ -194,6 +262,17 @@ class _Handler(BaseHTTPRequestHandler):
                 # Segments are MPEG-TS even when the CDN mislabels them
                 # (these hosts often serve .ts as image/png to dodge filters).
                 out_ctype = "video/mp2t"
+                host = urlparse(target).netloc
+                fix = _audio_fix.get(host)
+                if fix is None:
+                    fix = _probe_needs_audio_fix(data)
+                    _audio_fix[host] = fix
+                    if fix:
+                        logging.getLogger("pccaster").info(
+                            "HE-AAC audio detected on %s — re-encoding "
+                            "segment audio to AAC-LC for the Roku", host)
+                if fix:
+                    data = _transcode_audio_to_lc(data)
             self.send_response(200)
             self.send_header("Content-Type", out_ctype)
 

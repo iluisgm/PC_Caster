@@ -2,14 +2,18 @@
   PC Caster — Cast .m3u8 streams from your PC to your TV
 ═══════════════════════════════════════════════════════
 
-  (Quick start. Full docs are in README.md)
+  (Quick start. Full docs are in README.md and the GitHub Wiki)
 
 
 WHAT IT DOES
 ────────────
   Finds the live HLS (.m3u8) stream behind a web page, works
-  around the Referer/TLS blocks those streams use, and plays
-  it on your Roku TV through a small channel the app controls.
+  around the Referer/TLS blocks those streams use, ranks
+  candidates by how likely they are to keep working, and plays
+  the best one on your Roku TV through a small channel the app
+  controls. It also auto-fixes two TV-only playback quirks
+  (HE-AAC audio, oversized playlist sequence numbers) that can
+  make an otherwise-good stream fail only on the Roku.
 
 
 REQUIREMENTS
@@ -19,6 +23,7 @@ REQUIREMENTS
       ✓ tick "Add Python to PATH" during install
   • PC and Roku on the SAME network
   • VLC (optional, for the "Test on PC" button)
+  • ffmpeg + ffprobe (optional, enables the HE-AAC audio fix)
   Python packages (auto-installed): requests, playwright,
   curl_cffi, Pillow  + the Playwright Chromium browser.
 
@@ -28,9 +33,8 @@ INSTALL / RUN
   Double-click  run.bat
     → installs everything the first time, then launches.
 
-  For no console window, use one of these instead:
-    • PC Caster.vbs                 (double-click)
-    • Create Desktop Shortcut.bat   (run once for a desktop icon)
+  For no console window, use instead:
+    • PC Caster.vbs   (double-click)
 
 
 ONE-TIME TV SETUP (custom channel)
@@ -48,7 +52,7 @@ HOW TO USE
   1. Scan (or "＋ Add IP") and select your Roku.
   2. Click "🔍 Find .m3u8" → in the browser that opens, click
      the server you want and press play.
-  3. Pick the "index.m3u8 (adaptive)" entry → "Use selected".
+  3. The most reliable stream is pre-selected → "Use selected".
   4. (optional) "🖥 Test on PC" to preview in VLC.
   5. "▶ Cast to TV".
 
@@ -63,6 +67,8 @@ IF SOMETHING BREAKS
     the "PC Caster HLS Proxy" rule (port 8011).
   • Played then stopped → stream token expired; click
     "🔍 Find .m3u8" again to get a fresh link.
+  • No/broken audio, log says "Unsupported AAC stream" → install
+    ffmpeg + ffprobe and put them on PATH.
   • Never use the raw stream link directly — it is Referer/TLS-
     locked and only works through the app's proxy.
 
@@ -76,4 +82,4 @@ RESPONSIBLE USE
 
 VERSION
 ───────
-  1.1 — Built for Luis | June 2026
+  1.2 — Built for Luis | July 2026

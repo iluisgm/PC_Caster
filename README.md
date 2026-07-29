@@ -1,8 +1,23 @@
-# PC Caster
+<p align="center">
+  <img src="assets/app_glyph.png" width="96" alt="PC Caster logo">
+</p>
 
-**Cast live HLS / `.m3u8` video streams from your Windows PC to a Roku TV — no phone required.**
+<h1 align="center">PC Caster</h1>
+
+<p align="center">
+  <b>Cast live HLS / <code>.m3u8</code> video streams from your Windows PC to a Roku TV — no phone required.</b>
+</p>
+
+<p align="center">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6">
+  <img alt="python" src="https://img.shields.io/badge/python-3.9%2B-3776AB">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+  <img alt="status" src="https://img.shields.io/badge/status-active-brightgreen">
+</p>
 
 PC Caster finds the real stream behind a web page, works around the header/TLS protections those streams use, and plays them on your TV through a tiny Roku channel that the app fully controls.
+
+📖 **Looking for more depth?** The [project Wiki](../../wiki) has a full architecture walkthrough, an extended troubleshooting index, and an FAQ that goes beyond this README.
 
 ---
 
@@ -18,6 +33,7 @@ PC Caster finds the real stream behind a web page, works around the header/TLS p
 - [Project layout](#project-layout)
 - [Configuration & data](#configuration--data)
 - [Troubleshooting](#troubleshooting)
+- [Changelog](#changelog)
 - [Legal / responsible use](#legal--responsible-use)
 
 ---
@@ -27,14 +43,16 @@ PC Caster finds the real stream behind a web page, works around the header/TLS p
 A small **Windows desktop app** (Python + Tkinter) that casts video — especially **HLS live streams** (`.m3u8`) — from your PC to a **Roku TV** on the same network. It bundles:
 
 - a **stream finder** that detects the `.m3u8` behind a web page (like the "video detector" apps on phones),
-- a **local proxy** that makes header/TLS-locked streams playable by a TV,
+- a **local proxy** that makes header/TLS-locked streams playable by a TV, and transparently repairs the streams themselves when the TV's hardware decoder is pickier than a browser,
 - a **custom Roku channel** it installs and drives directly,
 - quality-of-life extras: PC playback test, live proxy indicator, branded icon, and a log file.
 
 ## What it does
 
 - **Find streams** – Open a page (e.g. a sports stream page), click the server you want, and PC Caster watches the network and captures the real `.m3u8` URL **plus the `Referer` header** the player used.
+- **Rank by reliability** – When a scan turns up several candidate streams, PC Caster scores each one (open CDN vs. token-gated "secure" link) and auto-selects the one most likely to **keep** playing instead of dying seconds after capture.
 - **Unlock streams** – Many streams reject anything that isn't a real browser (they check the HTTP `Referer` **and** the TLS fingerprint). PC Caster's proxy re-requests the stream **with a real Chrome TLS fingerprint and the right Referer**, so a device that can't send those (like a Roku) can still play it.
+- **Fix TV-only playback quirks** – Some streams play fine in a browser/VLC but fail on Roku's hardware decoder. The proxy detects and transparently fixes two of these on the fly (see [How it works](#how-it-works)).
 - **Cast to TV** – It plays through a custom **"PC Caster"** Roku channel that the app installs once and then controls every time.
 - **Test on PC** – Play the (proxied) stream in VLC first to confirm it's good before sending to the TV.
 - **(Legacy)** Basic Fire TV casting via ADB, and an experimental "use the stock Castify channel" mode.
@@ -52,12 +70,17 @@ A small **Windows desktop app** (Python + Tkinter) that casts video — especial
                                   (http://<PC-IP>:8011)
 ```
 
-1. **Find .m3u8** – A real browser opens; you click the server. PC Caster sniffs all network requests and grabs the `.m3u8` (the adaptive `index.m3u8`) and the `Referer`.
+1. **Find .m3u8** – A real browser opens; you click the server. PC Caster sniffs all network requests and grabs the `.m3u8` (the adaptive `index.m3u8`) and the `Referer`. If several streams show up, they're ranked by reliability and the best one is pre-selected.
 2. **Local proxy** – PC Caster runs a small HTTP server on your PC (port **8011**). For every request it re-fetches the real resource from the CDN using **`curl_cffi` (impersonating Chrome's TLS/JA3 fingerprint)** and injects the captured **`Referer`/`Origin`** headers. It rewrites the playlist so the video segments also flow through the proxy.
 3. **Cast** – PC Caster launches its Roku channel via the Roku ECP API and hands it the **proxy URL** (e.g. `http://192.168.1.50:8011/p.m3u8?...`).
 4. **Playback** – The Roku plays from your PC over plain HTTP — it never has to send any special headers, so it just works. A Windows Firewall rule (added automatically) lets the Roku reach your PC.
 
 > **Why the proxy is necessary:** the stream URL itself returns **403 Forbidden** to anything that isn't a real browser — wrong/missing Referer = 403, non-browser TLS fingerprint = 403. That's why pasting the raw `.m3u8` into VLC or a Roku fails. Only the proxied URL works.
+
+**Two TV-specific fixups happen inside the proxy, transparently:**
+
+- **HE-AAC → AAC-LC audio** – Roku's hardware decoder rejects HE-AAC (SBR) audio in `.ts` segments (`decoder:pump:Unsupported AAC stream`) even though it plays fine in VLC/a browser. If `ffmpeg`/`ffprobe` are on `PATH`, the proxy probes the first segment per host and, when it's HE-AAC, re-encodes just the audio to AAC-LC (video is stream-copied, so there's no quality loss or re-encode lag on the picture).
+- **Oversized `EXT-X-MEDIA-SEQUENCE` values** – A few hosts encode a date/timestamp into the sequence number (e.g. `20260706098359`), which overflows Roku's 32-bit playlist parser (`reader pick stream error: parsing failed`). The proxy detects the overflow and rewrites the sequence to a small, consistently-advancing number per playlist.
 
 ## Requirements
 
@@ -70,6 +93,7 @@ A small **Windows desktop app** (Python + Tkinter) that casts video — especial
 | **Roku in Developer Mode** | Needed for the custom "PC Caster" channel. One-time setup (below). |
 | **Same network** | PC and Roku must be on the same LAN / Wi-Fi. |
 | **VLC** *(optional)* | Only for the "Test on PC" button. <https://www.videolan.org/> |
+| **ffmpeg + ffprobe** *(optional)* | Only needed for the automatic HE-AAC → AAC-LC audio fix. If absent, the proxy skips the fix silently and everything else still works. <https://ffmpeg.org/download.html> |
 
 ## Installation
 
@@ -99,8 +123,8 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 1. Launch PC Caster.
 2. **Scan** for devices (or **＋ Add IP** and type the Roku's IP).
 3. Select your Roku in the list.
-4. Click **🔍 Find .m3u8**. A browser opens — click the server/quality you want and press play if needed. The stream appears in the scanner.
-5. Select the **`index.m3u8` (adaptive)** entry → **Use selected**.
+4. Click **🔍 Find .m3u8**. A browser opens — click the server/quality you want and press play if needed. Streams appear in the scanner sorted by reliability, most-likely-to-work first.
+5. Confirm the pre-selected entry (or pick another) → **Use selected**.
 6. *(Optional)* **🖥 Test on PC** to preview in VLC.
 7. **▶ Cast to TV**. The match plays through your channel.
 
@@ -109,7 +133,6 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 ## Running it without a console window
 
 - **`PC Caster.vbs`** – double-click to launch with **no console window** (portable; survives folder moves).
-- **`Create Desktop Shortcut.bat`** – run once to put a branded **PC Caster** icon on your Desktop (you can pin it to the taskbar). Re-run if you move the folder.
 - **`run.bat`** – use when dependencies need installing/updating (shows a console only during setup, then launches windowless).
 
 ## Project layout
@@ -117,8 +140,8 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 | File / folder | Purpose |
 |---|---|
 | `pc_caster.py` | Main app (GUI, casting, device discovery). |
-| `stream_finder.py` | Finds `.m3u8` streams by sniffing browser network traffic (Playwright). |
-| `hls_proxy.py` | Local HLS proxy: Chrome-TLS re-fetch, Referer injection, playlist rewriting, firewall rule. |
+| `stream_finder.py` | Finds `.m3u8` streams by sniffing browser network traffic (Playwright); scores/ranks them by reliability. |
+| `hls_proxy.py` | Local HLS proxy: Chrome-TLS re-fetch, Referer injection, playlist rewriting, firewall rule, HE-AAC audio fix, media-sequence overflow fix. |
 | `roku_deploy.py` | Builds, sideloads, and launches the Roku channel. |
 | `roku_receiver/` | Source of the **PC Caster** Roku channel (BrightScript / SceneGraph). |
 | `make_icons.py` | Generates the app + channel icons from one design. |
@@ -127,7 +150,6 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 | `requirements.txt` | Python dependencies. |
 | `run.bat` | Setup + launch. |
 | `PC Caster.vbs` | Windowless launcher. |
-| `Create Desktop Shortcut.bat` | Makes a branded desktop shortcut. |
 | `pc_caster.log` | Runtime log (auto-created, self-trimming). |
 
 ## Configuration & data
@@ -141,13 +163,22 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 | Symptom | Likely cause / fix |
 |---|---|
 | **TV blinks then nothing plays** | Firewall blocking the Roku → allow it (the app prompts via UAC), or run as admin once: `New-NetFirewallRule -DisplayName "PC Caster HLS Proxy" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8011 -Profile Private` |
-| **Played fine, then stopped** | Stream **token expired** (you'll see `proxy upstream HTTP 403` in the log). Click **🔍 Find .m3u8** again. |
+| **Played fine, then stopped** | Stream **token expired** (you'll see `proxy upstream HTTP 403` in the log). Click **🔍 Find .m3u8** again — the reliability ranking will favor a longer-lived stream if one is available. |
 | **Raw `.m3u8` won't open in VLC** | Expected — raw links are header/TLS-locked. Always use **Test on PC** / the proxied URL, never the raw stream link. |
 | **"Find .m3u8" finds nothing** | The stream only starts after you click a **server** and press play. Do that in the browser window the scanner opens. First run also needs Playwright: `pip install playwright` then `python -m playwright install chromium`. |
 | **Scan doesn't list the Roku** | Use **＋ Add IP** (Roku IP: *Settings → Network → About*). |
 | **Channel won't install** | Re-check Developer Mode is fully enabled and the **dev password** is correct (📺 TV App). |
 | **App won't start (windowless)** | Run `run.bat` once to see the error in a console, or open `pc_caster.log`. |
 | **Roku Media Player just shows a file browser** | That mode can't play these streams. Switch receiver mode to **My TV App** (📺 TV App). |
+| **Audio is silent, distorted, or the log shows "Unsupported AAC stream"** | The stream uses HE-AAC audio, which Roku's decoder rejects. Install `ffmpeg`/`ffprobe` and add them to `PATH` — the proxy will then auto-transcode audio to AAC-LC. |
+| **Roku shows "reader pick stream error: parsing failed"** | The playlist's `EXT-X-MEDIA-SEQUENCE` overflowed Roku's parser. This is auto-corrected by the proxy; if you still see it, re-run **🔍 Find .m3u8** to get a fresh playlist. |
+
+See the [Wiki](../../wiki) for a longer troubleshooting index and FAQ.
+
+## Changelog
+
+- **v1.2** — Automatic stream reliability ranking (open CDN vs. token-gated), HE-AAC → AAC-LC audio auto-fix for Roku playback, `EXT-X-MEDIA-SEQUENCE` overflow fix for hosts that encode timestamps into the sequence number.
+- **v1.1** — Initial public release: stream finder, HLS proxy with Chrome TLS impersonation, custom Roku channel, PC playback test, windowless launchers.
 
 ## Legal / responsible use
 
@@ -155,4 +186,4 @@ PC Caster is a general-purpose casting/relay tool. **You are responsible for onl
 
 ---
 
-*Built for Luis · June 2026 · v1.1*
+<p align="center"><i>Built for Luis · July 2026 · v1.2</i></p>
