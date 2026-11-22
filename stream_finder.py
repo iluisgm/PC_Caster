@@ -12,12 +12,18 @@ Two strategies, tried in order:
      clicks play, and captures every .m3u8 the player actually requests.
      This is what catches sites that build the stream URL dynamically.
 
+A playlist is recognised by ANY of: ".m3u8" in the URL, an HLS content-type
+(application/vnd.apple.mpegurl …) on the response, or a body that starts with
+"#EXTM3U". Many sites hide the playlist behind an extension-less URL such as
+https://host/web87 — and those usually autoplay, so there's no click to wait for.
+
 Public entry point:  find_streams(page_url, on_log=None, wait=20) -> list[dict]
-Each result dict: {"url", "referer", "origin", "label"}
+Each result dict: {"url", "referer", "origin", "label", "hls"}
 """
 
 import re
 import time
+from urllib.parse import urlparse as _urlparse
 
 import requests
 
@@ -42,14 +48,151 @@ def _label_for(url: str) -> str:
     return name[:48]
 
 
+def _clean_url(url: str) -> str:
+    """Drop jQuery-style '_=<timestamp>' cache-busters from the query.
+
+    Live players re-request the playlist every few seconds with a fresh
+    '&_=…', which would otherwise show up as a brand-new stream each time.
+    Other params are kept byte-for-byte so signed URLs stay valid.
+    """
+    base, sep, query = url.partition("?")
+    if not sep:
+        return url
+    query = query.split("#", 1)[0]
+    kept = [p for p in query.split("&") if p and p.split("=", 1)[0] != "_"]
+    return base + ("?" + "&".join(kept) if kept else "")
+
+
+# ── Network watcher shared by both browser scans ──────────────────────────────
+
+# Body-sniff only small text-ish XHR/fetch responses whose type doesn't already
+# say what they are — that's where disguised playlists hide.
+_SNIFF_CTYPES = ("", "text/plain", "application/octet-stream",
+                 "binary/octet-stream")
+_SEGMENT_EXTS = (".ts", ".m4s", ".mp4", ".m4a", ".m4v", ".aac", ".key",
+                 ".vtt", ".webm")
+_SNIFF_MAX_BYTES = 256 * 1024
+_SNIFF_MAX_COUNT = 80
+
+
+def _referer_for(req) -> tuple[str, str]:
+    """(referer, origin) the request was sent with.
+
+    Falls back to the requesting frame's origin when Chromium doesn't report a
+    Referer (some hosts check only Origin, and the proxy derives Origin from
+    the Referer we hand it — an empty one means a guaranteed 403)."""
+    h = {}
+    try:
+        h = req.headers or {}
+    except Exception:
+        pass
+    referer = h.get("referer", "")
+    origin = h.get("origin", "")
+    if not referer and origin and origin != "null":
+        referer = origin.rstrip("/") + "/"
+    if not referer:
+        try:
+            fu = _urlparse(req.frame.url)
+            if fu.scheme in ("http", "https") and fu.netloc:
+                referer = f"{fu.scheme}://{fu.netloc}/"
+        except Exception:
+            pass
+    return referer, origin
+
+
+class _StreamCollector:
+    """Watches every request/response in a browser context and records each
+    HLS playlist once — whether or not its URL says '.m3u8'.
+
+    on_new(item) fires for each newly-seen stream. Call drain() regularly from
+    the thread that owns the browser to run the (deferred) body sniffs.
+    """
+
+    def __init__(self, on_new):
+        self.found: dict[str, dict] = {}
+        self._on_new = on_new
+        self._checked: set[str] = set()
+        self._pending: list = []
+        self._sniffs = 0
+
+    def attach(self, ctx):
+        # Context-level events cover the page, every iframe and any popup tab.
+        ctx.on("request", self._on_request)
+        ctx.on("response", self._on_response)
+
+    def _add(self, url: str, req):
+        key = _clean_url(url)
+        if key in self.found:
+            return
+        referer, origin = _referer_for(req)
+        item = {"url": key, "referer": referer, "origin": origin,
+                "label": _label_for(key), "hls": True}
+        self.found[key] = item
+        try:
+            self._on_new(item)
+        except Exception:
+            pass
+
+    def _on_request(self, req):
+        try:
+            url = req.url
+        except Exception:
+            return
+        if _is_m3u8(url):
+            self._add(url, req)
+
+    def _on_response(self, resp):
+        try:
+            url = resp.url
+            if _is_m3u8(url) or not resp.ok:
+                return              # .m3u8 URLs are already caught on request
+            hdrs = resp.headers
+            ctype = (hdrs.get("content-type") or "").lower()
+            req = resp.request
+            rtype = req.resource_type
+        except Exception:
+            return
+
+        if "mpegurl" in ctype:      # application/vnd.apple.mpegurl, x-mpegurl…
+            self._add(url, req)
+            return
+
+        key = _clean_url(url)
+        if (key in self.found or key in self._checked
+                or rtype not in ("xhr", "fetch")
+                or ctype.split(";", 1)[0].strip() not in _SNIFF_CTYPES
+                or url.split("?", 1)[0].lower().endswith(_SEGMENT_EXTS)):
+            return
+        try:
+            if int(hdrs.get("content-length") or 0) > _SNIFF_MAX_BYTES:
+                return
+        except ValueError:
+            pass
+        self._checked.add(key)
+        self._pending.append(resp)
+
+    def drain(self):
+        """Read queued response bodies and keep the ones that are playlists."""
+        while self._pending:
+            resp = self._pending.pop(0)
+            if self._sniffs >= _SNIFF_MAX_COUNT:
+                self._pending.clear()
+                return
+            self._sniffs += 1
+            try:
+                head = resp.body()[:64]
+            except Exception:
+                continue
+            if head.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U"):
+                self._add(resp.url, resp.request)
+
+
 # ── Stream reliability ranking ────────────────────────────────────────────────
 # Some hosts hand out short-lived, single-session tokens (the URL contains a
 # "/secure/" gate and an opaque token). Streams from these die seconds after
 # capture — they play for ~1s then 403, so we rank them BELOW open CDNs. Open
 # CDNs (Rumble, CloudFront, Akamai…) serve plain segments that keep working, so
 # we prefer them automatically when a scan returns several candidates.
-
-from urllib.parse import urlparse as _urlparse
 
 _TOKEN_HOSTS = ("strmd.st", "indianservers.st")
 _OPEN_HOSTS = ("rumble.cloud", "cloudfront.net", "akamaized.net",
@@ -107,6 +250,7 @@ def _scrape_html(page_url: str, on_log) -> list[dict]:
                     "referer": page_url,
                     "origin": "",
                     "label": _label_for(m),
+                    "hls": True,
                 }
     except Exception as e:
         on_log(f"Quick scan failed: {e}")
@@ -127,31 +271,18 @@ def _sniff_browser(page_url: str, on_log, wait: int) -> list[dict]:
         return []
 
     on_log("Deep scan: launching headless browser…")
-    found = {}
-
-    def _record(req):
-        try:
-            url = req.url
-        except Exception:
-            return
-        if _is_m3u8(url) and url not in found:
-            h = {}
-            try:
-                h = req.headers
-            except Exception:
-                pass
-            found[url] = {
-                "url": url,
-                "referer": h.get("referer", ""),
-                "origin": h.get("origin", ""),
-                "label": _label_for(url),
-            }
-            on_log(f"  ✓ found stream: {_label_for(url)}")
+    col = _StreamCollector(
+        lambda item: on_log(f"  ✓ found stream: {item['label']}"))
+    found = col.found
 
     try:
         with sync_playwright() as p:
             try:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--autoplay-policy=no-user-gesture-required",
+                          "--mute-audio"],
+                )
             except Exception as e:
                 # Browser binary not installed yet
                 on_log("PLAYWRIGHT_NO_BROWSER")
@@ -162,13 +293,9 @@ def _sniff_browser(page_url: str, on_log, wait: int) -> list[dict]:
                 viewport={"width": 1280, "height": 720},
             )
 
-            # Watch requests on the main page AND any ad/popup tabs the site opens.
-            def _attach(page):
-                page.on("request", _record)
-
-            ctx.on("page", _attach)
+            # Watch the main page, its iframes AND any ad/popup tabs.
+            col.attach(ctx)
             page = ctx.new_page()
-            _attach(page)
 
             on_log("Loading page…")
             try:
@@ -185,6 +312,9 @@ def _sniff_browser(page_url: str, on_log, wait: int) -> list[dict]:
                 "button[aria-label*='play' i]", ".jw-icon-display", "body",
             ]
             while time.time() < deadline and not found:
+                col.drain()
+                if found:
+                    break           # autoplay already fired the playlist
                 for fr in page.frames:
                     for sel in click_selectors:
                         try:
@@ -205,6 +335,7 @@ def _sniff_browser(page_url: str, on_log, wait: int) -> list[dict]:
                     page.wait_for_timeout(2500)
                 except Exception:
                     pass
+            col.drain()
 
             browser.close()
     except Exception as e:
@@ -238,31 +369,12 @@ def find_streams_interactive(page_url, on_log, on_found, stop_event,
     if not page_url.startswith(("http://", "https://")):
         page_url = "https://" + page_url
 
-    found = {}
+    def _new(item):
+        on_log(f"  ✓ captured: {item['label']}")
+        on_found(item)
 
-    def _record(req):
-        try:
-            url = req.url
-        except Exception:
-            return
-        if _is_m3u8(url) and url not in found:
-            h = {}
-            try:
-                h = req.headers
-            except Exception:
-                pass
-            item = {
-                "url": url,
-                "referer": h.get("referer", ""),
-                "origin": h.get("origin", ""),
-                "label": _label_for(url),
-            }
-            found[url] = item
-            on_log(f"  ✓ captured: {_label_for(url)}")
-            try:
-                on_found(item)
-            except Exception:
-                pass
+    col = _StreamCollector(_new)
+    found = col.found
 
     try:
         with sync_playwright() as p:
@@ -277,11 +389,13 @@ def find_streams_interactive(page_url, on_log, on_found, stop_event,
                 return []
 
             ctx = browser.new_context(user_agent=USER_AGENT, viewport=None)
-            ctx.on("page", lambda pg: pg.on("request", _record))
+            # Attach BEFORE navigating: autoplaying players request their
+            # playlist within a second of load, with no click to wait for.
+            col.attach(ctx)
             main_page = ctx.new_page()
-            main_page.on("request", _record)
 
-            on_log("Browser open — click the server you want (TSN 4, FOX…).")
+            on_log("Browser open — if the video doesn't start by itself, "
+                   "click the server / play button.")
             try:
                 main_page.goto(page_url, wait_until="domcontentloaded",
                                timeout=40000)
@@ -290,6 +404,7 @@ def find_streams_interactive(page_url, on_log, on_found, stop_event,
 
             deadline = time.time() + max_seconds
             while time.time() < deadline and not stop_event.is_set():
+                col.drain()
                 # Reap ad-popup tabs so they don't bury the real window.
                 for pg in list(ctx.pages):
                     if pg is not main_page:
@@ -333,7 +448,7 @@ def find_streams(page_url: str, on_log=None, wait: int = 20) -> list[dict]:
     if _is_m3u8(page_url):
         return [{
             "url": page_url, "referer": "", "origin": "",
-            "label": _label_for(page_url),
+            "label": _label_for(page_url), "hls": True,
         }]
 
     for item in _scrape_html(page_url, on_log):

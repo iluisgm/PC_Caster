@@ -268,6 +268,7 @@ class PCCaster:
         self._cfg = _load_config()
         self._clipboard_last = ""
         self._last_referer = ""
+        self._last_stream: dict | None = None   # last scanner pick
         self._proxy = HlsProxy(port=8011)   # local HLS proxy (lazy-started)
 
         self._build_styles()
@@ -685,9 +686,10 @@ class PCCaster:
                  bg=BG, fg=FG, font=("Segoe UI", 13, "bold")).pack(anchor="w")
         tk.Label(
             f,
-            text="A browser window opened. Click the server you want (TSN 4, "
-                 "FOX, ITV1…) and press play if needed. Streams appear below "
-                 "the moment the player requests them.",
+            text="A browser window opened. If the video starts playing by "
+                 "itself, its stream shows up below within a few seconds. "
+                 "Otherwise click the server you want (TSN 4, FOX, ITV1…) and "
+                 "press play.",
             bg=BG, fg=MUTED, font=("Segoe UI", 9),
             wraplength=600, justify="left",
         ).pack(anchor="w", pady=(2, 10))
@@ -806,13 +808,15 @@ class PCCaster:
         urls = [f"[{stream_reliability(r)[1]}] {r['url'][:80]}" for r in ranked]
         log.info("Scan finished: %d stream(s) captured (best first): %s", n, urls)
         if n == 0:
-            self._set_status("No .m3u8 captured. Did you click a server link?", RED)
+            self._set_status("No stream captured. Did the video play in the "
+                             "scanner window?", RED)
         else:
             self._set_status(f"Scanner closed — {n} stream(s) captured.", GREEN)
 
     def _apply_stream(self, stream: dict):
         """Put the chosen .m3u8 in the URL box and remember its Referer."""
         self.url_var.set(stream["url"])
+        self._last_stream = stream
         self._last_referer = stream.get("referer", "")
         self._set_status(f"Selected stream: {stream['label']} — ready to cast.", GREEN)
         if self._last_referer:
@@ -930,11 +934,20 @@ class PCCaster:
 
     # ── Proxy helpers / PC test ─────────────────────────────────────────────────
 
+    def _is_hls(self, url: str) -> bool:
+        """True for .m3u8 links AND for playlists the scanner captured whose
+        URL doesn't say .m3u8 (e.g. https://host/web87 — detected by its
+        HLS content-type)."""
+        if ".m3u8" in url.split("?", 1)[0].lower():
+            return True
+        st = self._last_stream
+        return bool(st and st.get("hls") and st.get("url") == url)
+
     def _proxied_url(self, raw_url: str, target_ip: str = "8.8.8.8"):
         """Return (cast_url, is_hls). HLS goes through the local proxy."""
         if not raw_url.startswith(("http://", "https://")):
             raw_url = "https://" + raw_url
-        if ".m3u8" in raw_url.split("?", 1)[0].lower() and "/p.m3u8" not in raw_url:
+        if self._is_hls(raw_url) and "/p.m3u8" not in raw_url:
             self._proxy.start(target_ip=target_ip)
             return self._proxy.url_for(raw_url, self._last_referer or ""), True
         return raw_url, False
@@ -1034,7 +1047,7 @@ class PCCaster:
         # through the local proxy, which re-fetches with a browser TLS
         # fingerprint and injects the captured Referer so the TV can play them.
         cast_url = url
-        if ".m3u8" in url.split("?", 1)[0].lower() and "/p.m3u8" not in url:
+        if self._is_hls(url) and "/p.m3u8" not in url:
             try:
                 self._proxy.start(target_ip=dev["ip"])
                 # Make sure the TV can actually reach us (one-time UAC prompt).
@@ -1063,7 +1076,7 @@ class PCCaster:
         try:
             if dev["type"] == "Roku":
                 mode = self._cfg.get("receiver_mode", "mychannel")
-                fmt = "hls" if ".m3u8" in url.split("?", 1)[0].lower() else "mp4"
+                fmt = "hls" if self._is_hls(url) else "mp4"
                 if mode == "mychannel":
                     ok, msg = self._cast_via_channel(dev["ip"], url, fmt)
                 elif mode == "mediaplayer":
