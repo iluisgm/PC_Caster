@@ -20,12 +20,14 @@ Public API
 """
 
 import base64
+import io
 import logging
 import shutil
 import socket
 import subprocess
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse, parse_qs, quote, unquote
 
@@ -132,6 +134,66 @@ def _transcode_audio_to_lc(data: bytes) -> bytes:
             return p.stdout
     except Exception:
         pass
+    return data
+
+
+# ── Disguised segments ───────────────────────────────────────────────────────
+# Some hosts hide MPEG-TS segments inside real PNG images on image CDNs
+# (e.g. TikTok's) so they slip past filters; the site's player unpacks them in
+# JavaScript. The Roku can't, so the proxy hands it the plain TS instead.
+# Layouts handled:
+#   PNG → RGB pixel bytes → b"TIKTIKPX" + u32 length + gzip(MPEG-TS)
+#   PNG pixels or raw bytes → <junk prefix> + MPEG-TS
+_TS_PKT = 188
+_unwrapped_hosts: set[str] = set()
+
+
+def _ts_start(buf: bytes, limit: int = 65536, run: int = 5) -> int:
+    """Offset of the first run of `run` aligned TS packets (0x47 every 188
+    bytes) within the first `limit` bytes, or -1."""
+    i = buf.find(b"\x47", 0, limit)
+    while i >= 0:
+        if all(buf[i + _TS_PKT * k:i + _TS_PKT * k + 1] == b"\x47"
+               for k in range(1, run)):
+            return i
+        i = buf.find(b"\x47", i + 1, limit)
+    return -1
+
+
+def _whole_packets(buf: bytes, start: int) -> bytes:
+    n = (len(buf) - start) // _TS_PKT
+    return buf[start:start + n * _TS_PKT]
+
+
+def _unwrap_segment(data: bytes) -> bytes:
+    """Return plain MPEG-TS from a disguised segment; anything that isn't
+    recognisably wrapped TS (real TS, fMP4, AAC, keys) comes back unchanged."""
+    if data[:1] == b"\x47" and data[_TS_PKT:_TS_PKT + 1] in (b"\x47", b""):
+        return data             # already plain TS
+    candidates = []
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                candidates.append(im.tobytes())
+        except Exception:
+            pass
+    candidates.append(data)
+
+    for buf in candidates:
+        gz = buf.find(b"\x1f\x8b\x08", 0, 256)
+        if gz >= 0:
+            try:
+                ts = zlib.decompressobj(wbits=31).decompress(
+                    buf[gz:], 64 * 1024 * 1024)
+                s = _ts_start(ts)
+                if s >= 0:
+                    return _whole_packets(ts, s)
+            except Exception:
+                pass
+        s = _ts_start(buf)
+        if s >= 0:
+            return _whole_packets(buf, s)
     return data
 
 
@@ -263,6 +325,14 @@ class _Handler(BaseHTTPRequestHandler):
                 # (these hosts often serve .ts as image/png to dodge filters).
                 out_ctype = "video/mp2t"
                 host = urlparse(target).netloc
+                unwrapped = _unwrap_segment(data)
+                if unwrapped is not data:
+                    data = unwrapped
+                    if host not in _unwrapped_hosts:
+                        _unwrapped_hosts.add(host)
+                        logging.getLogger("pccaster").info(
+                            "Unpacked image-disguised video segments from %s",
+                            host)
                 fix = _audio_fix.get(host)
                 if fix is None:
                     fix = _probe_needs_audio_fix(data)

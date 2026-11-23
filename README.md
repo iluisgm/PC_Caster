@@ -70,15 +70,16 @@ A small **Windows desktop app** (Python + Tkinter) that casts video — especial
                                   (http://<PC-IP>:8011)
 ```
 
-1. **Find .m3u8** – A real browser opens; you click the server. PC Caster sniffs all network requests and grabs the `.m3u8` (the adaptive `index.m3u8`) and the `Referer`. If several streams show up, they're ranked by reliability and the best one is pre-selected.
+1. **Find .m3u8** – A real browser opens; if the video doesn't autoplay, you click the server. PC Caster sniffs all network requests and grabs the HLS playlist (the adaptive `index.m3u8`) and the `Referer`. A playlist is recognised by its URL **or** its HLS content-type / `#EXTM3U` body, so extension-less playlists like `https://host/web87` on autoplaying pages are caught too. If several streams show up, they're ranked by reliability and the best one is pre-selected.
 2. **Local proxy** – PC Caster runs a small HTTP server on your PC (port **8011**). For every request it re-fetches the real resource from the CDN using **`curl_cffi` (impersonating Chrome's TLS/JA3 fingerprint)** and injects the captured **`Referer`/`Origin`** headers. It rewrites the playlist so the video segments also flow through the proxy.
 3. **Cast** – PC Caster launches its Roku channel via the Roku ECP API and hands it the **proxy URL** (e.g. `http://192.168.1.50:8011/p.m3u8?...`).
 4. **Playback** – The Roku plays from your PC over plain HTTP — it never has to send any special headers, so it just works. A Windows Firewall rule (added automatically) lets the Roku reach your PC.
 
 > **Why the proxy is necessary:** the stream URL itself returns **403 Forbidden** to anything that isn't a real browser — wrong/missing Referer = 403, non-browser TLS fingerprint = 403. That's why pasting the raw `.m3u8` into VLC or a Roku fails. Only the proxied URL works.
 
-**Two TV-specific fixups happen inside the proxy, transparently:**
+**Three TV-specific fixups happen inside the proxy, transparently:**
 
+- **Image-disguised segments** – Some hosts hide each `.ts` segment inside a real PNG on an image CDN (e.g. TikTok's), and the site's player unpacks it in JavaScript. The proxy does the same unpacking (PNG pixels → gzip → MPEG-TS) so the Roku receives plain video.
 - **HE-AAC → AAC-LC audio** – Roku's hardware decoder rejects HE-AAC (SBR) audio in `.ts` segments (`decoder:pump:Unsupported AAC stream`) even though it plays fine in VLC/a browser. If `ffmpeg`/`ffprobe` are on `PATH`, the proxy probes the first segment per host and, when it's HE-AAC, re-encodes just the audio to AAC-LC (video is stream-copied, so there's no quality loss or re-encode lag on the picture).
 - **Oversized `EXT-X-MEDIA-SEQUENCE` values** – A few hosts encode a date/timestamp into the sequence number (e.g. `20260706098359`), which overflows Roku's 32-bit playlist parser (`reader pick stream error: parsing failed`). The proxy detects the overflow and rewrites the sequence to a small, consistently-advancing number per playlist.
 
@@ -165,7 +166,7 @@ The "PC Caster" channel now appears on your Roku home screen, and the app can dr
 | **TV blinks then nothing plays** | Firewall blocking the Roku → allow it (the app prompts via UAC), or run as admin once: `New-NetFirewallRule -DisplayName "PC Caster HLS Proxy" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8011 -Profile Private` |
 | **Played fine, then stopped** | Stream **token expired** (you'll see `proxy upstream HTTP 403` in the log). Click **🔍 Find .m3u8** again — the reliability ranking will favor a longer-lived stream if one is available. |
 | **Raw `.m3u8` won't open in VLC** | Expected — raw links are header/TLS-locked. Always use **Test on PC** / the proxied URL, never the raw stream link. |
-| **"Find .m3u8" finds nothing** | The stream only starts after you click a **server** and press play. Do that in the browser window the scanner opens. First run also needs Playwright: `pip install playwright` then `python -m playwright install chromium`. |
+| **"Find .m3u8" finds nothing** | If the video didn't start by itself, the stream only loads after you click a **server** and press play. Do that in the browser window the scanner opens. First run also needs Playwright: `pip install playwright` then `python -m playwright install chromium`. |
 | **Scan doesn't list the Roku** | Use **＋ Add IP** (Roku IP: *Settings → Network → About*). |
 | **Channel won't install** | Re-check Developer Mode is fully enabled and the **dev password** is correct (📺 TV App). |
 | **App won't start (windowless)** | Run `run.bat` once to see the error in a console, or open `pc_caster.log`. |
